@@ -152,8 +152,6 @@ struct Session {
     last_recv_time: Arc<Mutex<Instant>>,
     random_password: String,
     tfa: bool,
-    conn_type: AuthConnType,
-    conn_id: i32,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -217,7 +215,7 @@ pub struct Connection {
     server_audit_conn: String,
     server_audit_file: String,
     lr: LoginRequest,
-    last_recv_time: Arc<Mutex<Instant>>,
+    session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
     file_transferred: bool,
     #[cfg(windows)]
@@ -364,7 +362,7 @@ impl Connection {
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             lr: Default::default(),
-            last_recv_time: Arc::new(Mutex::new(Instant::now())),
+            session_last_recv_time: None,
             chat_unanswered: false,
             file_transferred: false,
             #[cfg(windows)]
@@ -595,7 +593,7 @@ impl Connection {
                             },
                             Ok(bytes) => {
                                 last_recv_time = Instant::now();
-                                *conn.last_recv_time.lock().unwrap() = Instant::now();
+                                conn.session_last_recv_time.as_mut().map(|t| *t.lock().unwrap() = Instant::now());
                                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
                                     if !conn.on_message(msg_in).await {
                                         break;
@@ -692,7 +690,7 @@ impl Connection {
                             }
                         }
                         Some(message::Union::MultiClipboards(_multi_clipboards)) => {
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                            #[cfg(not(target_os = "ios"))]
                             if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(&conn.lr.version, &conn.lr.my_platform, _multi_clipboards) {
                                 if let Err(err) = conn.stream.send(&msg_out).await {
                                     conn.on_close(&err.to_string(), false).await;
@@ -762,6 +760,7 @@ impl Connection {
         }
         if let Err(err) = conn.try_port_forward_loop(&mut rx_from_cm).await {
             conn.on_close(&err.to_string(), false).await;
+            raii::AuthedConnID::check_remove_session(conn.inner.id(), conn.session_key());
         }
 
         conn.post_conn_audit(json!({
@@ -1140,6 +1139,11 @@ impl Connection {
             auth_conn_type,
             self.session_key(),
         ));
+        self.session_last_recv_time = SESSIONS
+            .lock()
+            .unwrap()
+            .get(&self.session_key())
+            .map(|s| s.last_recv_time.clone());
         self.post_conn_audit(
             json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type}),
         );
@@ -1549,15 +1553,10 @@ impl Connection {
         if password::temporary_enabled() {
             let password = password::temporary_password();
             if self.validate_one_password(password.clone()) {
-                raii::AuthedConnID::insert_session(
+                raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
-                    Session {
-                        last_recv_time: self.last_recv_time.clone(),
-                        random_password: password,
-                        tfa: false,
-                        conn_type: self.conn_type(),
-                        conn_id: self.inner.id(),
-                    },
+                    Some(password),
+                    Some(false),
                 );
                 return true;
             }
@@ -1581,15 +1580,11 @@ impl Connection {
             .get(&self.session_key())
             .map(|s| s.to_owned());
         // last_recv_time is a mutex variable shared with connection, can be updated lively.
-        if let Some(mut session) = session {
+        if let Some(session) = session {
             if !self.lr.password.is_empty()
                 && (tfa && session.tfa
                     || !tfa && self.validate_one_password(session.random_password.clone()))
             {
-                session.last_recv_time = self.last_recv_time.clone();
-                session.conn_id = self.inner.id();
-                session.conn_type = self.conn_type();
-                raii::AuthedConnID::insert_session(self.session_key(), session);
                 log::info!("is recent session");
                 return true;
             }
@@ -1841,34 +1836,13 @@ impl Connection {
                     if res {
                         self.update_failure(failure, true, 1);
                         self.require_2fa.take();
+                        raii::AuthedConnID::set_session_2fa(self.session_key());
                         self.send_logon_response().await;
                         self.try_start_cm(
                             self.lr.my_id.to_owned(),
                             self.lr.my_name.to_owned(),
                             self.authorized,
                         );
-                        let session = SESSIONS
-                            .lock()
-                            .unwrap()
-                            .get(&self.session_key())
-                            .map(|s| s.to_owned());
-                        if let Some(mut session) = session {
-                            session.tfa = true;
-                            session.conn_id = self.inner.id();
-                            session.conn_type = self.conn_type();
-                            raii::AuthedConnID::insert_session(self.session_key(), session);
-                        } else {
-                            raii::AuthedConnID::insert_session(
-                                self.session_key(),
-                                Session {
-                                    last_recv_time: self.last_recv_time.clone(),
-                                    random_password: "".to_owned(),
-                                    tfa: true,
-                                    conn_type: self.conn_type(),
-                                    conn_id: self.inner.id(),
-                                },
-                            );
-                        }
                         if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
                             Config::add_trusted_device(TrustedDevice {
                                 hwid: tfa.hwid,
@@ -2100,7 +2074,9 @@ impl Connection {
                     if self.clipboard {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
-                        #[cfg(all(feature = "flutter", target_os = "android"))]
+                        // ios as the controlled side is actually not supported for now.
+                        // The following code is only used to preserve the logic of handling text clipboard on mobile.
+                        #[cfg(target_os = "ios")]
                         {
                             let content = if cb.compress {
                                 hbb_common::compress::decompress(&cb.content)
@@ -2118,14 +2094,17 @@ impl Connection {
                                 }
                             }
                         }
+                        #[cfg(target_os = "android")]
+                        crate::clipboard::handle_msg_clipboard(cb);
                     }
                 }
-                Some(message::Union::MultiClipboards(_mcb)) =>
-                {
+                Some(message::Union::MultiClipboards(_mcb)) => {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.clipboard {
                         update_clipboard(_mcb.clipboards, ClipboardSide::Host);
                     }
+                    #[cfg(target_os = "android")]
+                    crate::clipboard::handle_msg_multi_clipboards(_mcb);
                 }
                 Some(message::Union::Cliprdr(_clip)) =>
                 {
@@ -2170,6 +2149,9 @@ impl Connection {
                             }
                         }
                         match fa.union {
+                            Some(file_action::Union::ReadEmptyDirs(rd)) => {
+                                self.read_empty_dirs(&rd.path, rd.include_hidden);
+                            }
                             Some(file_action::Union::ReadDir(rd)) => {
                                 self.read_dir(&rd.path, rd.include_hidden);
                             }
@@ -2400,7 +2382,7 @@ impl Connection {
                     }
                     Some(misc::Union::CloseReason(_)) => {
                         self.on_close("Peer close", true).await;
-                        raii::AuthedConnID::remove_session_if_last_duplication(
+                        raii::AuthedConnID::check_remove_session(
                             self.inner.id(),
                             self.session_key(),
                         );
@@ -3163,7 +3145,15 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(msg_out).await;
-        raii::AuthedConnID::remove_session_if_last_duplication(self.inner.id(), self.session_key());
+        raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+    }
+
+    fn read_empty_dirs(&mut self, dir: &str, include_hidden: bool) {
+        let dir = dir.to_string();
+        self.send_fs(ipc::FS::ReadEmptyDirs {
+            dir,
+            include_hidden,
+        });
     }
 
     fn read_dir(&mut self, dir: &str, include_hidden: bool) {
@@ -3315,17 +3305,6 @@ impl Connection {
                 msg_out.set_misc(misc);
                 self.send(msg_out).await;
             }
-        }
-    }
-
-    #[inline]
-    fn conn_type(&self) -> AuthConnType {
-        if self.file_transfer.is_some() {
-            AuthConnType::FileTransfer
-        } else if self.port_forward_socket.is_some() {
-            AuthConnType::PortForward
-        } else {
-            AuthConnType::Remote
         }
     }
 
@@ -3871,50 +3850,75 @@ mod raii {
                 .count()
         }
 
-        pub fn remove_session_if_last_duplication(conn_id: i32, key: SessionKey) {
-            let contains = SESSIONS.lock().unwrap().contains_key(&key);
+        pub fn check_remove_session(conn_id: i32, key: SessionKey) {
+            let mut lock = SESSIONS.lock().unwrap();
+            let contains = lock.contains_key(&key);
             if contains {
-                let another = AUTHED_CONNS
+                // No two remote connections with the same session key, just for ensure.
+                let is_remote = AUTHED_CONNS
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|c| c.0 != conn_id && c.2 == key && c.1 != AuthConnType::PortForward);
-                if !another {
-                    // Keep the session if there is another connection with same peer_id and session_id.
-                    SESSIONS.lock().unwrap().remove(&key);
+                    .any(|c| c.0 == conn_id && c.1 == AuthConnType::Remote);
+                // If there are 2 connections with the same peer_id and session_id, a remote connection and a file transfer or port forward connection,
+                // If any of the connections is closed allowing retry, this will not be called;
+                // If the file transfer/port forward connection is closed with no retry, the session should be kept for remote control menu action;
+                // If the remote connection is closed with no retry, keep the session is not reasonable in case there is a retry button in the remote side, and ignore network fluctuations.
+                let another_remote = AUTHED_CONNS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.0 != conn_id && c.2 == key && c.1 == AuthConnType::Remote);
+                if is_remote || !another_remote {
+                    lock.remove(&key);
                     log::info!("remove session");
                 } else {
+                    // Keep the session if there is another remote connection with same peer_id and session_id.
                     log::info!("skip remove session");
                 }
             }
         }
 
-        pub fn insert_session(key: SessionKey, session: Session) {
-            let mut insert = true;
-            if session.conn_type == AuthConnType::PortForward {
-                // port forward doesn't update last received time
-                let other_alive_conns = AUTHED_CONNS
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|c| {
-                        c.2 == key && c.1 != AuthConnType::PortForward // port forward doesn't remove itself
-                    })
-                    .map(|c| c.0)
-                    .collect::<Vec<_>>();
-                let another = SESSIONS.lock().unwrap().get(&key).map(|s| {
-                    other_alive_conns.contains(&s.conn_id)
-                        && s.tfa == session.tfa
-                        && s.conn_type != AuthConnType::PortForward
-                }) == Some(true);
-                if another {
-                    insert = false;
-                    log::info!("skip insert session for port forward");
+        pub fn update_or_insert_session(
+            key: SessionKey,
+            password: Option<String>,
+            tfa: Option<bool>,
+        ) {
+            let mut lock = SESSIONS.lock().unwrap();
+            let session = lock.get_mut(&key);
+            if let Some(session) = session {
+                if let Some(password) = password {
+                    session.random_password = password;
                 }
+                if let Some(tfa) = tfa {
+                    session.tfa = tfa;
+                }
+            } else {
+                lock.insert(
+                    key,
+                    Session {
+                        random_password: password.unwrap_or_default(),
+                        tfa: tfa.unwrap_or_default(),
+                        last_recv_time: Arc::new(Mutex::new(Instant::now())),
+                    },
+                );
             }
-            if insert {
-                log::info!("insert session for {:?}", session.conn_type);
-                SESSIONS.lock().unwrap().insert(key, session);
+        }
+
+        pub fn set_session_2fa(key: SessionKey) {
+            let mut lock = SESSIONS.lock().unwrap();
+            let session = lock.get_mut(&key);
+            if let Some(session) = session {
+                session.tfa = true;
+            } else {
+                lock.insert(
+                    key,
+                    Session {
+                        last_recv_time: Arc::new(Mutex::new(Instant::now())),
+                        random_password: "".to_owned(),
+                        tfa: true,
+                    },
+                );
             }
         }
     }
